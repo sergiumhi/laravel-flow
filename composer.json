@@ -1,0 +1,60 @@
+{
+    "name": "sergiumhi/laravel-flow",
+    "description": "A lightweight job orchestrator for Laravel: composable, observable pipelines of queued jobs with revert (saga) and fan-out (subtask) support.",
+    "keywords": [
+        "laravel",
+        "queue",
+        "jobs",
+        "orchestrator",
+        "workflow",
+        "saga",
+        "pipeline"
+    ],
+    "type": "library",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Sergiu Mihai",
+            "email": "sergiumhi@gmail.com"
+        }
+    ],
+    "require": {
+        "php": "^8.3",
+        "laravel/framework": "^13.0",
+        "nikic/php-parser": "^5.7"
+    },
+    "require-dev": {
+        "orchestra/testbench": "^11.0",
+        "phpunit/phpunit": "^12.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Sergiumhi\\LaravelFlow\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Sergiumhi\\LaravelFlow\\Tests\\": "tests/",
+            "Workbench\\App\\": "workbench/app/",
+            "Workbench\\Database\\": "workbench/database/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Sergiumhi\\LaravelFlow\\FlowServiceProvider"
+            ]
+        }
+    },
+    "scripts": {
+        "post-autoload-dump": [
+            "@php vendor/bin/testbench package:discover --ansi"
+        ],
+        "test": "@php vendor/bin/phpunit"
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}

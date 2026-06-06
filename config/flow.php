@@ -36,6 +36,24 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Events
+    |--------------------------------------------------------------------------
+    |
+    | When enabled, the engine dispatches a plain domain event on every flow and
+    | task status transition (FlowStateChanged / FlowTaskStateChanged), each
+    | carrying the model plus the `from` and `to` status. These events are NOT
+    | broadcastable by design — subscribe in your app and decide how to deliver
+    | them (broadcast over websockets, publish to Redis for SSE, send a
+    | notification, log, etc.). Turn this off to skip dispatching entirely.
+    |
+    */
+
+    'events' => [
+        'enabled' => true,
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Pruning
     |--------------------------------------------------------------------------
     |

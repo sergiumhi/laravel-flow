@@ -11,6 +11,7 @@ use PhpParser\NodeFinder;
 use PhpParser\NodeTraverser;
 use PhpParser\NodeVisitor\NameResolver;
 use PhpParser\ParserFactory;
+use Sergiumhi\LaravelFlow\Events\FlowTaskStateChanged;
 use Sergiumhi\LaravelFlow\Jobs\FlowOrchestratorJob;
 use Sergiumhi\LaravelFlow\Jobs\FlowTaskJob;
 use Sergiumhi\LaravelFlow\Models\FlowModel;
@@ -638,11 +639,21 @@ class FlowOrchestrator
      */
     private function abandonUnmatchedSeedRows(FlowModel $flow): void
     {
-        $flow->tasks()
+        $rows = $flow->tasks()
             ->whereNull('parent_id')
             ->whereNull('index')
             ->where('status', FlowTaskStatus::Pending->value)
-            ->update(['status' => FlowTaskStatus::Abandoned]);
+            ->get();
+
+        if ($rows->isEmpty()) {
+            return;
+        }
+
+        // Bulk-update for a single query; query-builder updates skip Eloquent
+        // events, so dispatch the per-row transition events ourselves.
+        $flow->tasks()->whereKey($rows->modelKeys())->update(['status' => FlowTaskStatus::Abandoned]);
+
+        $this->emitTaskTransitions($rows, FlowTaskStatus::Abandoned);
     }
 
     /**
@@ -652,13 +663,49 @@ class FlowOrchestrator
      */
     private function cancelRemainingTasks(FlowModel $flow): void
     {
-        $flow->tasks()
+        $rows = $flow->tasks()
             ->whereIn('status', [
                 FlowTaskStatus::Pending->value,
                 FlowTaskStatus::Running->value,
                 FlowTaskStatus::Waiting->value,
             ])
-            ->update(['status' => FlowTaskStatus::Cancelled]);
+            ->get();
+
+        if ($rows->isEmpty()) {
+            return;
+        }
+
+        // Bulk-update for a single query; query-builder updates skip Eloquent
+        // events, so dispatch the per-row transition events ourselves.
+        $flow->tasks()->whereKey($rows->modelKeys())->update(['status' => FlowTaskStatus::Cancelled]);
+
+        $this->emitTaskTransitions($rows, FlowTaskStatus::Cancelled);
+    }
+
+    /**
+     * Dispatch a FlowTaskStateChanged for each row whose status was forced to
+     * $to by a bulk update, using each row's own prior status as `from`. Gated
+     * on the same config flag as the model-event observers so toggling events
+     * off silences every path uniformly.
+     *
+     * @param  \Illuminate\Support\Collection<int, FlowTask>  $rows
+     */
+    private function emitTaskTransitions($rows, FlowTaskStatus $to): void
+    {
+        if (! config('flow.events.enabled', true)) {
+            return;
+        }
+
+        foreach ($rows as $row) {
+            $from = $row->status;
+
+            if ($from === $to) {
+                continue;
+            }
+
+            $row->setAttribute('status', $to);
+            event(new FlowTaskStateChanged($row, $from, $to));
+        }
     }
 
     private function dispatchTask(FlowTask $row, Task $task): void

@@ -8,6 +8,11 @@ use Sergiumhi\LaravelFlow\Console\Commands\FlowPruneCommand;
 use Sergiumhi\LaravelFlow\Console\Commands\FlowRunCommand;
 use Sergiumhi\LaravelFlow\Console\Commands\FlowSignalCommand;
 use Sergiumhi\LaravelFlow\Console\Commands\FlowStatusCommand;
+use Sergiumhi\LaravelFlow\Events\FlowStateChanged;
+use Sergiumhi\LaravelFlow\Events\FlowTaskStateChanged;
+use Sergiumhi\LaravelFlow\Models\FlowModel;
+use Sergiumhi\LaravelFlow\Models\FlowTask;
+use Sergiumhi\LaravelFlow\Support\FlowModels;
 
 class FlowServiceProvider extends ServiceProvider
 {
@@ -40,6 +45,38 @@ class FlowServiceProvider extends ServiceProvider
         }
 
         $this->registerPruneSchedule();
+        $this->registerStateChangeEvents();
+    }
+
+    /**
+     * Emit a domain event on every real status transition. Implemented as model
+     * `updated` listeners (not a refactor of the orchestrator's ~38 status
+     * writes) so it is correct by construction: `wasChanged('status')` fires
+     * only on an actual change and `getOriginal('status')` yields the pre-save
+     * enum, giving a clean from→to with no column-write noise.
+     *
+     * Listeners are bound to the *configured* models so a host app that swaps
+     * `flow.flow_model` / `flow.flow_tasks_model` still emits. The two bulk
+     * cleanup updates in FlowOrchestrator bypass Eloquent events and dispatch
+     * their own per-row events directly.
+     */
+    private function registerStateChangeEvents(): void
+    {
+        if (! config('flow.events.enabled', true)) {
+            return;
+        }
+
+        FlowModels::flow()::updated(static function (FlowModel $flow): void {
+            if ($flow->wasChanged('status')) {
+                event(new FlowStateChanged($flow, $flow->getOriginal('status'), $flow->status));
+            }
+        });
+
+        FlowModels::task()::updated(static function (FlowTask $task): void {
+            if ($task->wasChanged('status')) {
+                event(new FlowTaskStateChanged($task, $task->getOriginal('status'), $task->status));
+            }
+        });
     }
 
     /**

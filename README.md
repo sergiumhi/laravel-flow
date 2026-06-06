@@ -37,6 +37,7 @@ to the current position by replaying the outputs of completed steps.
 - [Revert (saga pattern)](#revert-saga-pattern)
 - [Manual control of a running flow](#manual-control-of-a-running-flow)
 - [Job timing](#job-timing)
+- [Events (live updates)](#events-live-updates)
 - [Status reference](#status-reference)
 - [Artisan commands](#artisan-commands)
 - [Configuration](#configuration)
@@ -404,6 +405,72 @@ From these you can derive queue wait (`started - dispatched`), execution time
 (`finished - started`), and total time. For a task with subtasks, the parent's
 `job_finished_at` is set when the **last subtask** completes.
 
+## Events (live updates)
+
+Every time a flow or a task changes status, the engine dispatches a plain
+domain event so you can drive live UIs (polling, SSE, websockets), send
+notifications, or write metrics:
+
+| Event | Dispatched when | Payload |
+|---|---|---|
+| `FlowStateChanged` | A flow's `status` changes | `$flow` (model), `$from`, `$to` (`FlowStatus`) |
+| `FlowTaskStateChanged` | A task's `status` changes | `$task` (model), `$from`, `$to` (`FlowTaskStatus`) |
+
+Both carry `from`/`to` so a listener can react to a specific transition without
+re-querying:
+
+```php
+use Sergiumhi\LaravelFlow\Events\FlowStateChanged;
+use Sergiumhi\LaravelFlow\FlowStatus;
+
+Event::listen(function (FlowStateChanged $event) {
+    if ($event->to === FlowStatus::Failed) {
+        // notify, log, alert…
+        report(new FlowFailed($event->flow->public_id));
+    }
+});
+```
+
+These events are **deliberately not broadcastable** — they do not implement
+`ShouldBroadcast`. The engine only announces "this flow/task moved from X to Y";
+*how* that reaches a browser is your app's choice, so the package never forces a
+websocket stack on consumers who just want to log or notify. The delivery
+mechanism does not change anything in the package — the same single event feeds
+all three:
+
+- **Polling** — ignore the events entirely; the `flows` / `flow_tasks` tables
+  are the source of truth, so just query them on an interval.
+- **Websockets (Reverb / Echo)** — re-broadcast in a thin app-side listener:
+
+  ```php
+  // app/Events/FlowUpdated.php — your app's broadcastable wrapper
+  class FlowUpdated implements ShouldBroadcast
+  {
+      public function __construct(public string $flowId, public string $status) {}
+
+      public function broadcastOn(): Channel
+      {
+          return new PrivateChannel("flows.{$this->flowId}");
+      }
+  }
+
+  // A listener on the package event rebroadcasts it
+  Event::listen(function (FlowStateChanged $event) {
+      broadcast(new FlowUpdated($event->flow->public_id, $event->to->value));
+  });
+  ```
+
+- **SSE** — bridge to Redis and block on a subscribe in your SSE endpoint:
+
+  ```php
+  Event::listen(function (FlowStateChanged $event) {
+      Redis::publish("flows.{$event->flow->public_id}", $event->to->value);
+  });
+  ```
+
+Disable dispatching entirely via config (see
+[Configuration](#configuration)) — set `flow.events.enabled` to `false`.
+
 ## Status reference
 
 ### Flow statuses (`flows.status`)
@@ -470,6 +537,12 @@ return [
     // The namespace segment under app/ that holds your flow classes (App\Flows).
     // Used by flow:run to resolve a flow from a short name.
     'flows_folder' => 'Flows',
+
+    // Dispatch FlowStateChanged / FlowTaskStateChanged on every status
+    // transition (see "Events"). Set to false to skip dispatching entirely.
+    'events' => [
+        'enabled' => true,
+    ],
 
     'prune' => [
         'command' => \Sergiumhi\LaravelFlow\Console\Commands\FlowPruneCommand::class,

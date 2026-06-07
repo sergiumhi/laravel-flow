@@ -57,6 +57,69 @@ class InitSeedingTest extends TestCase
         );
     }
 
+    public function test_it_records_branch_point_for_a_task_output_driven_branch(): void
+    {
+        $model = $this->makeRecord(TaskBranchFlow::class);
+
+        app(FlowOrchestrator::class)->init($model);
+
+        $rows = $model->allTopLevelTasks()->orderBy('source_order')->get()
+            ->keyBy(fn (FlowTask $row): string => $row->task_class);
+
+        // The task before the if is on the main spine.
+        $this->assertNull($rows[SeedFirstTask::class]->branch_point_source_order);
+
+        // Both arms fork from that task's source_order, regardless of which
+        // branch is taken at runtime (here keyed on a task output).
+        $first = $rows[SeedFirstTask::class]->source_order;
+        $this->assertSame($first, $rows[SeedLeftTask::class]->branch_point_source_order);
+        $this->assertSame($first, $rows[SeedRightTask::class]->branch_point_source_order);
+
+        // The task after the if rejoins the spine.
+        $this->assertNull($rows[SeedLastTask::class]->branch_point_source_order);
+    }
+
+    public function test_it_records_branch_point_for_a_signal_driven_branch(): void
+    {
+        $model = $this->makeRecord(SeedShapeFlow::class);
+
+        app(FlowOrchestrator::class)->init($model);
+
+        $rows = $model->allTopLevelTasks()->orderBy('source_order')->get();
+
+        $signal = $rows->firstWhere('signal_name', 'approve');
+        $left = $rows->firstWhere('task_class', SeedLeftTask::class);
+        $right = $rows->firstWhere('task_class', SeedRightTask::class);
+
+        // The if keys on the signal payload, so both arms fork from the signal.
+        $this->assertSame($signal->source_order, $left->branch_point_source_order);
+        $this->assertSame($signal->source_order, $right->branch_point_source_order);
+
+        // The signal itself, and the trailing task, are on the spine.
+        $this->assertNull($signal->branch_point_source_order);
+        $this->assertNull($rows->firstWhere('task_class', SeedLastTask::class)->branch_point_source_order);
+    }
+
+    public function test_it_uses_the_innermost_enclosing_if_for_nested_branches(): void
+    {
+        $model = $this->makeRecord(NestedBranchFlow::class);
+
+        app(FlowOrchestrator::class)->init($model);
+
+        $rows = $model->allTopLevelTasks()->orderBy('source_order')->get()
+            ->keyBy(fn (FlowTask $row): string => $row->task_class);
+
+        $first = $rows[SeedFirstTask::class]->source_order;
+        $left = $rows[SeedLeftTask::class]->source_order;
+
+        // The outer-arm task forks from the task before the outer if.
+        $this->assertSame($first, $rows[SeedLeftTask::class]->branch_point_source_order);
+
+        // The inner-arm task forks from the last spine yield before the inner
+        // if (SeedLeftTask), not from the outer fork point.
+        $this->assertSame($left, $rows[SeedRightTask::class]->branch_point_source_order);
+    }
+
     private function makeRecord(string $flowClass): FlowModel
     {
         return FlowModel::query()->create([
@@ -82,6 +145,38 @@ class SeedShapeFlow extends Flow
         }
 
         yield SeedLastTask::init();
+    }
+}
+
+class TaskBranchFlow extends Flow
+{
+    public function run(array $payload): Generator
+    {
+        $prev = yield SeedFirstTask::init();
+
+        if (($prev['ok'] ?? false) === true) {
+            yield SeedLeftTask::init();
+        } else {
+            yield SeedRightTask::init();
+        }
+
+        yield SeedLastTask::init();
+    }
+}
+
+class NestedBranchFlow extends Flow
+{
+    public function run(array $payload): Generator
+    {
+        $prev = yield SeedFirstTask::init();
+
+        if (($prev['ok'] ?? false) === true) {
+            yield SeedLeftTask::init();
+
+            if (($prev['deep'] ?? false) === true) {
+                yield SeedRightTask::init();
+            }
+        }
     }
 }
 

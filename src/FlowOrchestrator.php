@@ -10,6 +10,7 @@ use PhpParser\Node;
 use PhpParser\NodeFinder;
 use PhpParser\NodeTraverser;
 use PhpParser\NodeVisitor\NameResolver;
+use PhpParser\NodeVisitor\ParentConnectingVisitor;
 use PhpParser\ParserFactory;
 use Sergiumhi\LaravelFlow\Events\FlowTaskStateChanged;
 use Sergiumhi\LaravelFlow\Jobs\FlowOrchestratorJob;
@@ -66,6 +67,11 @@ class FlowOrchestrator
 
             $sourceOrder = 0;
 
+            // Counted yields so far, as [source_order => start file position],
+            // in ascending source order. Used to resolve a branch arm's
+            // divergence point (the last spine yield before its enclosing if).
+            $countedYields = [];
+
             // findInstanceOf walks the tree in source order, so both sides of a
             // conditional are seeded in the order they appear.
             foreach ($finder->findInstanceOf($runMethod, Node\Expr\Yield_::class) as $yield) {
@@ -84,7 +90,9 @@ class FlowOrchestrator
                     $fqcn = $root->class->toString();
 
                     if (class_exists($fqcn) && is_a($fqcn, Task::class, true)) {
-                        $parentRow = $this->persistSeededTaskRow($flowModel, $sourceOrder++, $fqcn::init());
+                        $branchPoint = $this->branchPointFor($yield, $countedYields);
+                        $countedYields[$sourceOrder] = $yield->getStartFilePos();
+                        $parentRow = $this->persistSeededTaskRow($flowModel, $sourceOrder++, $fqcn::init(), null, $branchPoint);
 
                         // Tasks fan out by returning a SubTaskCollection from
                         // handle() — invisible from run(). Reflect into the task's
@@ -101,7 +109,9 @@ class FlowOrchestrator
                     $arg = $root->args[0] ?? null;
 
                     if ($arg instanceof Node\Arg && $arg->value instanceof Node\Scalar\String_) {
-                        $this->persistSeededSignalRow($flowModel, $sourceOrder++, $arg->value->value);
+                        $branchPoint = $this->branchPointFor($yield, $countedYields);
+                        $countedYields[$sourceOrder] = $yield->getStartFilePos();
+                        $this->persistSeededSignalRow($flowModel, $sourceOrder++, $arg->value->value, $branchPoint);
                     }
                 }
             }
@@ -127,9 +137,62 @@ class FlowOrchestrator
 
         // Resolve every name reference to its fully-qualified form so the
         // ::init() / ::waitFor() / SubTaskCollection class references are absolute.
-        $ast = (new NodeTraverser(new NameResolver))->traverse($ast);
+        // ParentConnectingVisitor lets the seeder walk up to each yield's
+        // enclosing if/else when computing branch divergence points.
+        $ast = (new NodeTraverser(new NameResolver, new ParentConnectingVisitor))->traverse($ast);
 
         return $this->parsedFiles[$path] = $ast;
+    }
+
+    /**
+     * The divergence point of a seeded yield: the source_order of the spine
+     * yield it forks from, or null when the yield is on the main spine (not
+     * inside any if/else). Derived purely from AST structure, so it works for
+     * branches keyed on anything (task output, signal, payload flag).
+     *
+     * @param  array<int, int>  $countedYields  [source_order => start file pos], ascending
+     */
+    private function branchPointFor(Node\Expr\Yield_ $yield, array $countedYields): ?int
+    {
+        $if = $this->enclosingIf($yield);
+
+        if ($if === null) {
+            return null;
+        }
+
+        $ifPos = $if->getStartFilePos();
+        $branchPoint = null;
+
+        // $countedYields is in ascending source order, so the last entry whose
+        // start position precedes the if is the spine yield the branch forks from.
+        foreach ($countedYields as $sourceOrder => $startPos) {
+            if ($startPos < $ifPos) {
+                $branchPoint = $sourceOrder;
+            }
+        }
+
+        return $branchPoint;
+    }
+
+    /**
+     * The nearest enclosing if statement of a node, by walking up the parent
+     * attributes set by ParentConnectingVisitor. The innermost If_ is found
+     * first (nested branches resolve correctly); a yield in an else/elseif
+     * resolves to the same outer If_ its arm belongs to.
+     */
+    private function enclosingIf(Node $node): ?Node\Stmt\If_
+    {
+        $current = $node->getAttribute('parent');
+
+        while ($current instanceof Node) {
+            if ($current instanceof Node\Stmt\If_) {
+                return $current;
+            }
+
+            $current = $current->getAttribute('parent');
+        }
+
+        return null;
     }
 
     /**
@@ -1035,13 +1098,14 @@ class FlowOrchestrator
      * subtask preview child ($parentId set) is replaced by the real fan-out when
      * the parent's handle() runs, or abandoned if its branch is never taken.
      */
-    private function persistSeededTaskRow(FlowModel $flow, int $sourceOrder, Task $task, ?int $parentId = null): FlowTask
+    private function persistSeededTaskRow(FlowModel $flow, int $sourceOrder, Task $task, ?int $parentId = null, ?int $branchPointSourceOrder = null): FlowTask
     {
         return $flow->tasks()->create([
             'public_id' => 'task_'.Str::ulid(),
             'parent_id' => $parentId,
             'index' => null,
             'source_order' => $sourceOrder,
+            'branch_point_source_order' => $branchPointSourceOrder,
             'task_class' => $task::class,
             'revert_class' => $task->revertClass(),
             'on_failure' => $task->failureMode(),
@@ -1053,13 +1117,14 @@ class FlowOrchestrator
     /**
      * Create a seeded signal preview row (index=null).
      */
-    private function persistSeededSignalRow(FlowModel $flow, int $sourceOrder, string $name): FlowTask
+    private function persistSeededSignalRow(FlowModel $flow, int $sourceOrder, string $name, ?int $branchPointSourceOrder = null): FlowTask
     {
         return $flow->tasks()->create([
             'public_id' => 'task_'.Str::ulid(),
             'parent_id' => null,
             'index' => null,
             'source_order' => $sourceOrder,
+            'branch_point_source_order' => $branchPointSourceOrder,
             'task_class' => null,
             'signal_name' => $name,
             'status' => FlowTaskStatus::Pending,

@@ -22,6 +22,8 @@ return new class extends Migration
                 ->cascadeOnDelete();
             $table->unsignedInteger('index')->nullable();          // runtime 0-based position; null until the seeded row is promoted
             $table->unsignedInteger('source_order')->nullable();  // position in run() source order; set on seeded rows, null for subtasks
+            $table->unsignedInteger('branch_point_source_order')
+                ->nullable();
             $table->string('task_class')->nullable();              // App\Tasks\ProcessPaymentTask (null for signal rows)
             $table->string('revert_class')->nullable();            // App\Tasks\RefundPaymentTask — revert task for this step
             $table->string('subtask_mode')->nullable();            // null, 'parallel', 'sequential' — set on parent

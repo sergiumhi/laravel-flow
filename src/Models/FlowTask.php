@@ -21,6 +21,7 @@ use Sergiumhi\LaravelFlow\Support\FlowModels;
  * @property int|null $parent_id
  * @property int|null $index
  * @property int|null $source_order
+ * @property int|null $branch_point_source_order
  * @property class-string|null $task_class
  * @property class-string|null $revert_class
  * @property string|null $subtask_mode

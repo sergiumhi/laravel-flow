@@ -184,11 +184,8 @@ class FlowOrchestrator
 
             $childClasses = $this->subtaskChildClasses($finder, $first);
 
-            // source_order is per-sibling here (0..N), mirroring the index a real
-            // fan-out child gets — it gives the previews a stable display order
-            // rather than relying on insertion order (their index is null).
-            foreach ($childClasses as $childOrder => $childClass) {
-                $this->persistSeededTaskRow($flow, $childOrder, $childClass::init(), $parentRow->id);
+            foreach ($childClasses as $childClass) {
+                $this->persistSeededTaskRow($flow, 0, $childClass::init(), $parentRow->id);
             }
         } catch (\Throwable) {
             // Best-effort preview; never break seeding.

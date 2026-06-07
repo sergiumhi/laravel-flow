@@ -29,6 +29,14 @@ use UnexpectedValueException;
 class FlowOrchestrator
 {
     /**
+     * Parsed, name-resolved ASTs keyed by file path — so a source file is
+     * parsed once across the seeding of a single flow.
+     *
+     * @var array<string, Node\Stmt[]>
+     */
+    private array $parsedFiles = [];
+
+    /**
      * Statically analyse run() to pre-seed every yield in source order. Both
      * sides of conditional branches are seeded as preview rows (index=null).
      * Rows are promoted to execution rows (index assigned) by reconcileTaskRow /
@@ -40,11 +48,7 @@ class FlowOrchestrator
             $class = $flowModel->flow_class;
             $file = (new \ReflectionClass($class))->getFileName();
 
-            $ast = (new ParserFactory)->createForHostVersion()->parse(file_get_contents($file));
-
-            // Resolve every name reference to its fully-qualified form so the
-            // ::init() / ::waitFor() class references below are absolute.
-            $ast = (new NodeTraverser(new NameResolver))->traverse($ast);
+            $ast = $this->parseFile($file);
 
             $finder = new NodeFinder;
 
@@ -80,7 +84,12 @@ class FlowOrchestrator
                     $fqcn = $root->class->toString();
 
                     if (class_exists($fqcn) && is_a($fqcn, Task::class, true)) {
-                        $this->persistSeededTaskRow($flowModel, $sourceOrder++, $fqcn::init());
+                        $parentRow = $this->persistSeededTaskRow($flowModel, $sourceOrder++, $fqcn::init());
+
+                        // Tasks fan out by returning a SubTaskCollection from
+                        // handle() — invisible from run(). Reflect into the task's
+                        // handle() to seed preview children for the fan-out.
+                        $this->seedSubtaskPreviews($flowModel, $parentRow, $fqcn);
                     }
 
                     continue;
@@ -100,6 +109,124 @@ class FlowOrchestrator
             // Pre-seeding is purely cosmetic; ignore all failures.
         }
 
+    }
+
+    /**
+     * Parse a PHP file into a name-resolved AST. Cached per path so a file is
+     * parsed once even when several seeded tasks live in it.
+     *
+     * @return Node\Stmt[]
+     */
+    private function parseFile(string $path): array
+    {
+        if (isset($this->parsedFiles[$path])) {
+            return $this->parsedFiles[$path];
+        }
+
+        $ast = (new ParserFactory)->createForHostVersion()->parse(file_get_contents($path)) ?? [];
+
+        // Resolve every name reference to its fully-qualified form so the
+        // ::init() / ::waitFor() / SubTaskCollection class references are absolute.
+        $ast = (new NodeTraverser(new NameResolver))->traverse($ast);
+
+        return $this->parsedFiles[$path] = $ast;
+    }
+
+    /**
+     * Statically inspect a seeded task's handle() for a SubTaskCollection it
+     * returns, and seed one preview child per declared subtask. The count is
+     * only known when handle() returns a literal array of ::init() calls; a
+     * dynamically built collection (array_map, spread, …) is previewed as one
+     * row per distinct subtask class. Purely cosmetic and best-effort.
+     */
+    private function seedSubtaskPreviews(FlowModel $flow, FlowTask $parentRow, string $taskFqcn): void
+    {
+        try {
+            $file = (new \ReflectionClass($taskFqcn))->getFileName();
+
+            if ($file === false) {
+                return;
+            }
+
+            $ast = $this->parseFile($file);
+            $finder = new NodeFinder;
+
+            $classNode = $finder->findFirst($ast, fn (Node $node): bool => $node instanceof Node\Stmt\Class_
+                && $node->namespacedName?->toString() === ltrim($taskFqcn, '\\'));
+
+            $handle = $classNode === null ? null : $finder->findFirst(
+                $classNode,
+                fn (Node $node): bool => $node instanceof Node\Stmt\ClassMethod && $node->name->toString() === 'handle',
+            );
+
+            if ($handle === null) {
+                return;
+            }
+
+            // The SubTaskCollection::parallel()/sequential() call(s) inside handle().
+            $collections = $finder->find($handle, fn (Node $node): bool => $node instanceof Node\Expr\StaticCall
+                && $node->class instanceof Node\Name
+                && $node->class->toString() === ltrim(SubTaskCollection::class, '\\')
+                && $node->name instanceof Node\Identifier
+                && in_array($node->name->toString(), ['parallel', 'sequential'], true));
+
+            if ($collections === []) {
+                return;
+            }
+
+            // The first collection determines the fan-out mode shown on the parent.
+            $first = $collections[0];
+            $parentRow->update([
+                'subtask_mode' => $first->name->toString() === 'sequential'
+                    ? SubTaskCollection::MODE_SEQUENTIAL
+                    : SubTaskCollection::MODE_PARALLEL,
+            ]);
+
+            $childClasses = $this->subtaskChildClasses($finder, $first);
+
+            foreach ($childClasses as $childClass) {
+                $this->persistSeededTaskRow($flow, 0, $childClass::init(), $parentRow->id);
+            }
+        } catch (\Throwable) {
+            // Best-effort preview; never break seeding.
+        }
+    }
+
+    /**
+     * Resolve the subtask classes to preview for a SubTaskCollection call.
+     * A literal array argument yields one entry per ::init() element (repeats
+     * kept, count known); any other argument yields one entry per distinct class.
+     *
+     * @return list<class-string<Task>>
+     */
+    private function subtaskChildClasses(NodeFinder $finder, Node\Expr\StaticCall $collection): array
+    {
+        $arg = $collection->args[0] ?? null;
+        $literal = $arg instanceof Node\Arg && $arg->value instanceof Node\Expr\Array_;
+
+        $classes = [];
+        $seen = [];
+
+        foreach ($finder->find($collection, fn (Node $node): bool => $node instanceof Node\Expr\StaticCall
+            && $node->class instanceof Node\Name
+            && $node->name instanceof Node\Identifier
+            && $node->name->toString() === 'init') as $init) {
+            $fqcn = $init->class->toString();
+
+            if (! class_exists($fqcn) || ! is_a($fqcn, Task::class, true)) {
+                continue;
+            }
+
+            // Non-literal: collapse duplicates (count is unknown at this point).
+            if (! $literal && isset($seen[$fqcn])) {
+                continue;
+            }
+
+            $seen[$fqcn] = true;
+            $classes[] = $fqcn;
+        }
+
+        return $classes;
     }
 
     /**
@@ -639,8 +766,9 @@ class FlowOrchestrator
      */
     private function abandonUnmatchedSeedRows(FlowModel $flow): void
     {
+        // index IS NULL uniquely identifies seeded preview rows — both top-level
+        // seeds and subtask preview children (real subtasks always have an index).
         $rows = $flow->tasks()
-            ->whereNull('parent_id')
             ->whereNull('index')
             ->where('status', FlowTaskStatus::Pending->value)
             ->get();
@@ -762,6 +890,11 @@ class FlowOrchestrator
 
             return;
         }
+
+        // Drop any seeded preview children (index=null) before creating the real
+        // fan-out; otherwise their Pending status would block completeParent's
+        // all-done check and the parent would never complete.
+        $parent->children()->delete();
 
         $parent->update([
             'subtask_mode' => $collection->mode,
@@ -894,14 +1027,16 @@ class FlowOrchestrator
     }
 
     /**
-     * Create a seeded preview row (index=null). Promoted to an execution row
-     * by reconcileTaskRow when the generator actually reaches this task.
+     * Create a seeded preview row (index=null). A top-level seed is promoted to
+     * an execution row by reconcileTaskRow when the generator reaches it; a
+     * subtask preview child ($parentId set) is replaced by the real fan-out when
+     * the parent's handle() runs, or abandoned if its branch is never taken.
      */
-    private function persistSeededTaskRow(FlowModel $flow, int $sourceOrder, Task $task): FlowTask
+    private function persistSeededTaskRow(FlowModel $flow, int $sourceOrder, Task $task, ?int $parentId = null): FlowTask
     {
         return $flow->tasks()->create([
             'public_id' => 'task_'.Str::ulid(),
-            'parent_id' => null,
+            'parent_id' => $parentId,
             'index' => null,
             'source_order' => $sourceOrder,
             'task_class' => $task::class,

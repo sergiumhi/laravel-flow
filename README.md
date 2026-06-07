@@ -585,7 +585,8 @@ own schedule definition instead.
 1. OrderFlow::start(['order_id' => 1])
    → creates a flows row (status: pending)
    → statically analyses run() to seed every top-level yield (both sides of
-     conditionals) as preview rows — for full DAG visibility up front
+     conditionals) as preview rows, plus a preview child for any fan-out a
+     task's handle() declares — for full DAG visibility up front
    → dispatches FlowOrchestratorJob
 
 2. FlowOrchestratorJob (advance)
@@ -609,8 +610,17 @@ At `start()`, the framework statically analyses `run()` (via `nikic/php-parser`)
 — parsing every `yield SomeTask::init(...)` and `yield Signal::waitFor(...)` in
 source order, including **both sides of every conditional branch**. Each becomes
 a *seed row* that the orchestrator *promotes* to a real execution row as the
-generator actually reaches it. Branches never taken are marked `abandoned`. This
-gives the full shape of the flow up front, before anything runs.
+generator actually reaches it. Branches never taken are marked `abandoned`.
+
+It also looks one level deeper: for each seeded task it inspects that task's
+`handle()` for a `SubTaskCollection::parallel(...)` / `::sequential(...)` and
+seeds **preview child rows** under the parent — so a fan-out shows up in the DAG
+before it runs. A literal list (e.g. `sequential([A::init(), A::init()])`) seeds
+one child per element; a dynamically built collection (e.g. `array_map` over
+runtime data, where the count is unknowable) seeds one child per distinct subtask
+class. When the parent actually fans out at runtime, the previews are replaced by
+the real children; if its branch is never taken, they are marked `abandoned`.
+This gives the full shape of the flow up front, before anything runs.
 
 ## Testing
 
